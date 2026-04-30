@@ -1,0 +1,345 @@
+# Product Intelligence Spec
+**AI PM Learner — adaptive digest + quiz platform**
+
+---
+
+## Why this doc exists
+
+The deployment, hosting, and CI/CD are table stakes — any engineer can figure those out.
+The USP of this product lives in three places:
+
+1. How well-curated the daily digest is (the hook that brings you back)
+2. How well agents hand off context to each other (the intelligence layer)
+3. How gracefully the system handles failure (the trust layer)
+
+---
+
+## System overview
+
+```
+[Celery 7am trigger]
+        ↓
+[Content Curation Agent]  ←— reads: syllabus_state, read_history (Supabase)
+        |                  ←— tools: web_search, fetch_article, dedup_check (pgvector)
+        | ContentToAssessmentContext (Pydantic, validated)
+        ↓
+[Assessment Agent]         ←— reads: top_chunks (pgvector RAG), question_history
+        |                  ←— tools: retrieve_chunks, generate_question, evaluate_answer
+        | QuizResult (Pydantic, validated)
+        ↓
+[Adaptive Engine]          ←— runs: SM-2 algorithm
+        |                  ←— writes: new syllabus_state, next_review_date
+        ↓
+[Supabase]                 ←— user reads digest + takes quiz via Next.js frontend
+```
+
+Orchestration layer: LangGraph state machine
+Each node is a Python function. Each edge is a conditional based on agent output.
+Max steps: 12 (hard cap — prevents infinite loops, the n8n failure mode).
+
+---
+
+## 1. Content Curation Agent
+
+### The goal
+Return the 2 best articles for this specific user on this specific day.
+Not 2 random articles on "RAG". The 2 that fill their exact current gap.
+
+### What "best" means — the quality rubric
+
+Every candidate article is scored across 5 dimensions:
+
+| Dimension | How it's measured | Weight |
+|---|---|---|
+| Source reputation | Whitelist: Anthropic=10, HF=9, arXiv=8, TDS=6, Medium=3, unknown=skip | 25% |
+| Recency | <30d=10, <90d=7, <1yr=4, older=skip | 20% |
+| Level match | LLM scores: does the article's depth match the user's current level (1–5)? | 25% |
+| Novelty | Cosine similarity vs read history in pgvector. >0.85 = skip | 20% |
+| Concept density | LLM scores: how many distinct learnable concepts does this article contain? | 10% |
+
+**Open question:** Are these weights right? Validate after 2 weeks of real usage by
+checking whether users score higher on topics where level_match was >0.8.
+
+### How the search intent is built
+
+The agent reads the user's `syllabus_state` and constructs a search query
+that encodes level + weak concept + recency requirement:
+
+```
+Level 2, weak on "RAG retrieval strategies":
+→ "RAG retrieval strategies practical tutorial 2025"
+
+Level 4, weak on "agentic AI evaluation":
+→ "agentic AI evaluation metrics production 2025 advanced"
+
+NOT just: "RAG" or "agentic AI"
+```
+
+The query template is part of the agent's system prompt. It must be updated
+when new topics are added to the syllabus.
+
+### Diversity rule
+
+The 2 articles must come from different domains.
+If both top candidates share a domain, take #1 and #3.
+
+Always include one "AI PM pulse" article — what's happening in the field this week —
+alongside the deep-dive on the user's current weak topic. This mirrors how real
+PMs stay current: one depth item, one breadth item per day.
+
+### Curation rationale — the handoff note
+
+After selecting articles, the agent writes a plain-English note explaining why:
+
+> "User scored 0.31 on retrieval strategies 8 days ago. Article 1 is a practical
+> chunking guide from HuggingFace. Article 2 covers hybrid search as a contrast.
+> Recommend quiz focuses on the fixed-size vs semantic chunking tradeoff."
+
+This note travels to the Assessment Agent. It is the difference between
+a targeted quiz and a generic one.
+
+**Do not skip this step to save tokens.** The quality degradation is visible immediately.
+
+### Chunking and embedding
+
+- Chunk size: 500 tokens, 50-token overlap
+- Embedding model: `text-embedding-3-small` (OpenAI) or equivalent
+- Store in: Supabase pgvector extension (free, no separate vector DB needed at MVP scale)
+- Dedup check: run cosine similarity against last 14 days of the user's read history
+
+---
+
+## 2. The Handoff Protocol
+
+### Why this matters
+
+In a workflow (n8n, Zapier), agents are stateless API calls. Information is lost
+between steps. The Assessment Agent doesn't know *why* this article was chosen.
+
+In this system, the Content Agent writes a structured context object that the
+Assessment Agent reads before doing anything. The agent has *intent*, not just data.
+
+### The Pydantic model
+
+```python
+class ContentToAssessmentContext(BaseModel):
+    article_id: UUID
+    top_chunks: list[Chunk]           # pre-retrieved, relevance-scored against weak_concepts
+    curation_rationale: str           # agent's plain-English reasoning
+    suggested_focus: str              # e.g. "chunking strategy tradeoffs"
+    user_context: UserContext
+
+class UserContext(BaseModel):
+    level: int                        # 1–5, from syllabus_state
+    weak_concepts: list[str]          # topics with last_score < 0.6
+    question_history: list[str]       # last 5 questions asked — avoid repeating
+    session_time_budget_min: int      # from onboarding: 5 / 15 / 30
+    answer_style_pref: str            # "conceptual" | "applied" — inferred from past answers
+
+class Chunk(BaseModel):
+    text: str
+    relevance_score: float            # cosine similarity vs weak_concepts query
+```
+
+### Validation rule
+
+If this model fails Pydantic validation, the session aborts at the handoff boundary —
+not mid-quiz. The user sees a "retry" state, not a broken quiz.
+The malformed payload is logged in full for debugging.
+
+Fallback: Assessment Agent runs with article text only (no curation_rationale),
+producing a less targeted but not broken quiz.
+
+---
+
+## 3. Assessment Agent
+
+### The goal
+
+Generate a question that targets the user's *specific* knowledge gap,
+grounded in the *actual article* they just read, at the right difficulty level.
+
+### RAG at question time (not just ingestion time)
+
+The agent doesn't generate questions from its training data memory.
+It retrieves the top-3 chunks most relevant to the user's weak_concepts
+via pgvector cosine search, then generates a question grounded in those chunks.
+
+This is why the answer evaluation is reliable — the rubric is built from
+the same source material as the question.
+
+### Question type by level
+
+| Level | Question format | Example |
+|---|---|---|
+| 1–2 | Define, identify, list | "What is the difference between fixed-size and semantic chunking?" |
+| 3 | Compare, explain mechanism | "Explain how chunk overlap affects retrieval recall." |
+| 4–5 | Apply to scenario, evaluate tradeoffs | "Your RAG pipeline returns irrelevant chunks 30% of the time. Based on today's article, what would you change first and why?" |
+
+### Anti-repetition check
+
+Before generating, the agent reads `question_history` (last 5 questions).
+If the last 3 all touched the same concept, rotate to a different facet —
+even if that concept is still the user's weakest.
+
+Variety > strict targeting over short windows. Monotony kills retention.
+
+### Evaluation rubric
+
+Generated alongside the question, stored with the quiz session:
+
+```python
+expected_concepts: list[str]  # 3–4 ideas a correct answer should touch
+
+# Example:
+expected_concepts = [
+    "fixed-size chunking can split mid-sentence losing context",
+    "semantic chunking preserves meaning boundaries",
+    "chunk size creates a precision vs recall tradeoff",
+]
+```
+
+The LLM evaluator (Groq Haiku) checks how many expected_concepts appear
+in the user's answer — conceptually, not as exact string matches.
+
+Score: 0.0–1.0. Also returns confidence: 0.0–1.0.
+
+### Handling vague or short answers
+
+If the answer is <20 words or contains "not sure / idk / don't know / maybe":
+1. Agent asks once: "Can you say a bit more? Even a rough idea is fine."
+2. If still vague after one follow-up: score at 0.4 (partial), show what was missing.
+3. Never ask twice. Don't interrogate the user.
+
+### Handling low evaluator confidence
+
+If evaluation confidence < 0.5:
+- Show user: "Your answer might be on the right track — here's what the article says."
+- Apply half the normal SM-2 delta (don't punish ambiguous evaluation)
+- Log for prompt improvement
+
+---
+
+## 4. Adaptive Engine — SM-2 Algorithm
+
+### Why SM-2
+
+SM-2 is the algorithm behind Anki. It's battle-tested for spaced repetition.
+For each topic, it tracks: current level (1–5), ease_factor (how well the
+user retains this), interval (days until next review), and last_score.
+
+### The update logic
+
+```python
+def update_sm2(score: float, ease_factor: float, interval: int) -> tuple:
+    if score >= 0.6:
+        if interval == 0:
+            new_interval = 1
+        elif interval == 1:
+            new_interval = 6
+        else:
+            new_interval = round(interval * ease_factor)
+        new_ef = ease_factor + (0.1 - (1 - score) * (0.08 + (1 - score) * 0.02))
+    else:
+        new_interval = 1  # reset — review tomorrow
+        new_ef = ease_factor
+    new_ef = max(1.3, new_ef)  # floor
+    return new_interval, new_ef
+
+def compute_difficulty_delta(score: float, current_level: int) -> int:
+    if score >= 0.85 and current_level < 5:
+        return +1   # promote
+    if score < 0.4 and current_level > 1:
+        return -1   # demote
+    return 0        # stay
+```
+
+### Plateau detection
+
+If a user scores ≥0.85 for 5 consecutive sessions on the same topic:
+- Auto-promote to next difficulty level
+- Rotate to an adjacent topic for variety
+- Log as `difficulty_promotion` event (useful for product analytics)
+
+**This is a product differentiator.** Static curricula can't do this.
+Mention it in interviews: "The system watches you get better and raises the bar automatically."
+
+---
+
+## 5. Error Handling Strategy
+
+### Principle
+
+Silent failures are the real product risk. Every error must have:
+1. A defined recovery path (user always gets something)
+2. A log event with enough context to debug
+3. No blank pages or broken quizzes visible to the user
+
+### Error catalogue
+
+| Scenario | Severity | Recovery |
+|---|---|---|
+| No qualifying articles found | P0 | Retry with relaxed threshold → static content bank fallback |
+| LLM API timeout / 5xx | P0 | Exponential backoff (3x) → downgrade model → serve yesterday's digest |
+| Pydantic validation fails on handoff | P1 | Abort at boundary → run assessment with article text only |
+| Orchestrator exceeds max_steps=12 | P1 | Session marked incomplete → retry button shown → full state logged |
+| Embedding storage fails | P2 | Continue without embedding → re-queue → dedup skipped for this article |
+| Evaluator confidence persistently low | P2 | Switch to MCQ format for that topic until confidence stabilises |
+| User scores 0.9+ for 5 sessions (plateau) | Handled | Auto-promote + topic rotation (not an error — a success signal) |
+| Duplicate content slips through | P1 | Second cosine check before delivery → replace with next candidate |
+
+### What NOT to do
+
+- Never show a generic "something went wrong" page. Always tell the user what happened and give them an action.
+- Never silently swallow an exception without logging the full payload.
+- Never retry more than 3 times on LLM calls — you'll block the Celery worker queue.
+
+---
+
+## 6. Open Questions (resolve during build)
+
+These are decisions we haven't made yet. Answer them with real data after 2 weeks of usage.
+
+| Question | Why it matters | How to decide |
+|---|---|---|
+| Are the quality rubric weights right? | Directly affects content relevance | Track: do higher level_match scores → higher quiz scores? |
+| What's the right chunk size? | Affects retrieval precision | A/B test 300 vs 500 vs 800 tokens on quiz score outcomes |
+| How many topics per onboarding? | Too many = shallow coverage, too few = boredom | Start with 3 forced, cap at 6 |
+| When to introduce a new topic vs reinforce existing? | Pacing affects retention | After user hits level 3 on current topics, introduce one new one |
+| Should the AI PM pulse article always be included? | Breadth vs depth tradeoff | Track engagement: do users open the pulse article? After 30 days, cut or keep |
+| What does "level 5" actually look like for each topic? | Without definition, the rubric is vague | Write level descriptors for each topic before building the rubric prompt |
+
+---
+
+## 7. Prompts to Write (Day 2–4 of build)
+
+These are the prompts that determine product quality. Write them carefully.
+Each should be versioned in `/prompts/` and tested before going into production.
+
+- `prompts/curation_quality_scorer.md` — scores an article against the quality rubric
+- `prompts/search_intent_builder.md` — builds the search query from user's syllabus state
+- `prompts/curation_rationale_writer.md` — writes the handoff note
+- `prompts/question_generator.md` — generates the quiz question from chunks + user context
+- `prompts/answer_evaluator.md` — evaluates user's free-text answer against expected_concepts
+- `prompts/level_descriptors.md` — defines what level 1–5 looks like for each topic
+
+---
+
+## 8. What to tell a hiring manager
+
+When asked "what's interesting about this project technically":
+
+> "The product's value isn't in the deployment — it's in the intelligence layer.
+> The Content Agent doesn't just search a topic; it reads your learning history,
+> scores candidates against a quality rubric, and writes a curation rationale
+> that travels to the Assessment Agent as a typed Pydantic model. That means
+> every quiz question is grounded in the actual article content via RAG, and
+> targeted at your specific knowledge gap — not just a generic question about RAG.
+> The adaptive engine uses SM-2 to decide whether to go deeper, stay lateral,
+> or reinforce, and detects when you've plateaued and promotes you automatically.
+> The whole thing is orchestrated with LangGraph with a max_steps cap and
+> typed handoff boundaries — so when something fails, it fails cleanly."
+
+---
+
+*Update this doc when a decision changes. The date at the top is the contract.*
